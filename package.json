@@ -1,0 +1,35 @@
+{
+  "name": "jarvis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal context graph: every conversation, decision and outcome, queryable by any AI agent.",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "dev": "tsc --watch",
+    "db:up": "docker compose up -d && sleep 5 && npm run db:migrate",
+    "db:migrate": "node --experimental-strip-types src/cli.ts migrate",
+    "db:test": "node --experimental-strip-types src/cli.ts test",
+    "ingest": "node --experimental-strip-types src/cli.ts ingest",
+    "embed": "node --experimental-strip-types src/cli.ts embed",
+    "serve": "node --experimental-strip-types src/cli.ts serve",
+    "mcp": "node --experimental-strip-types src/mcp/stdio.ts",
+    "doctor": "node --experimental-strip-types src/cli.ts doctor",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "pg": "^8.13.1"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

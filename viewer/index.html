@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<style>
+  :root {
+    --bg: #07090c; --panel: #11151b; --line: #222a35;
+    --ink: #e8edf4; --muted: #8b97a8;
+    --bitdeer: #e0564a; --lawrence: #e0a23c; --scottsdale: #5cc8d8; --personal: #8d7fe0;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 0; left: 0; right: 0; padding: 12px 16px; display: flex;
+         gap: 12px; align-items: center; flex-wrap: wrap;
+         background: linear-gradient(var(--bg), transparent); pointer-events: none; }
+  #hud > * { pointer-events: auto; }
+  .brand { font-weight: 600; letter-spacing: .14em; text-transform: uppercase; font-size: 12px; }
+  .chip { border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+          border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .chip.on { color: var(--ink); border-color: currentColor; }
+  .chip[data-space=bitdeer].on { color: var(--bitdeer); }
+  .chip[data-space=lawrence].on { color: var(--lawrence); }
+  .chip[data-space=scottsdale].on { color: var(--scottsdale); }
+  .chip[data-space=personal].on { color: var(--personal); }
+  input { background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+          border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 12px; }
+  #panel { position: fixed; right: 0; top: 0; bottom: 0; width: min(380px, 90vw);
+           background: var(--panel); border-left: 1px solid var(--line); padding: 20px;
+           overflow: auto; transform: translateX(100%); transition: transform .18s ease; }
+  #panel.open { transform: none; }
+  #panel h2 { margin: 0 0 4px; font-size: 18px; }
+  #panel .kind { color: var(--muted); font-size: 12px; text-transform: uppercase;
+                 letter-spacing: .1em; margin-bottom: 16px; }
+  #panel section { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  #panel h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+              color: var(--muted); margin: 0 0 8px; }
+  #panel li { margin-bottom: 6px; }
+  #panel ul { margin: 0; padding-left: 16px; }
+  #close { position: absolute; top: 14px; right: 14px; background: none; border: 0;
+           color: var(--muted); font-size: 20px; cursor: pointer; }
+  #status { position: fixed; bottom: 14px; left: 16px; color: var(--muted); font-size: 12px; }
+  #gate { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); }
+  #gate div { max-width: 420px; text-align: center; }
+  #gate p { color: var(--muted); }
+  button.go { background: var(--ink); color: var(--bg); border: 0; border-radius: 8px;
+              padding: 8px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+</style>
+</head>
+<body>
+
+<div id="gate"><div>
+  <h1 class="brand">Jarvis</h1>
+  <p>Paste the token from your <code>.env</code> (<code>JARVIS_HTTP_TOKEN</code>).</p>
+  <input id="token" type="password" placeholder="token" style="width:100%;margin-bottom:10px">
+  <button class="go" id="enter">Open the map</button>
+</div></div>
+
+<div id="hud" hidden>
+  <span class="brand">Jarvis</span>
+  <span class="chip on" data-space="scottsdale">Scottsdale</span>
+  <span class="chip on" data-space="lawrence">Lawrence</span>
+  <span class="chip on" data-space="personal">Personal</span>
+  <span class="chip" data-space="bitdeer">Bitdeer</span>
+  <input id="find" placeholder="Find someone…" />
+</div>
+
+<div id="panel"><button id="close">&times;</button><div id="panelBody"></div></div>
+<div id="status"></div>
+
+<script type="module">
+import * as THREE from "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js";
+
+const COLORS = { bitdeer: 0xe0564a, lawrence: 0xe0a23c, scottsdale: 0x5cc8d8, personal: 0x8d7fe0 };
+const status = (t) => (document.getElementById("status").textContent = t);
+let token = "";
+
+const api = async (path, opts = {}) => {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), authorization: `Bearer ${token}`, "content-type": "application/json" },
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.json();
+};
+
+// ---------------------------------------------------------------- scene
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x07090c, 0.0016);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 6000);
+camera.position.set(0, 0, 620);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const key = new THREE.PointLight(0xffffff, 600, 3000);
+key.position.set(300, 300, 500);
+scene.add(key);
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// Drag to orbit, wheel to zoom. Small enough not to warrant a control library.
+let yaw = 0, pitch = 0, radius = 620, dragging = false, last = null;
+renderer.domElement.addEventListener("pointerdown", (e) => { dragging = true; last = e; });
+addEventListener("pointerup", () => { dragging = false; last = null; });
+addEventListener("pointermove", (e) => {
+  if (!dragging || !last) return;
+  yaw -= (e.clientX - last.clientX) * 0.005;
+  pitch = Math.max(-1.4, Math.min(1.4, pitch - (e.clientY - last.clientY) * 0.005));
+  last = e;
+});
+renderer.domElement.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  radius = Math.max(120, Math.min(2600, radius * (1 + Math.sign(e.deltaY) * 0.1)));
+}, { passive: false });
+
+// ----------------------------------------------------------- force layout
+
+// Barnes-Hut would be overkill: a few hundred nodes settle fine with plain
+// pairwise repulsion, and keeping it inline means no extra dependency.
+let nodes = [], edges = [], meshes = [], lineGeo = null, lines = null;
+
+function layoutStep() {
+  const repulsion = 2600, spring = 0.0055, damping = 0.86, centering = 0.0018;
+  for (const a of nodes) {
+    for (const b of nodes) {
+      if (a === b) continue;
+      let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+      let d2 = dx * dx + dy * dy + dz * dz || 1;
+      if (d2 > 360000) continue;              // ignore distant pairs
+      const f = repulsion / d2;
+      const d = Math.sqrt(d2);
+      a.vx += (dx / d) * f; a.vy += (dy / d) * f; a.vz += (dz / d) * f;
+    }
+    a.vx -= a.x * centering; a.vy -= a.y * centering; a.vz -= a.z * centering;
+  }
+  for (const e of edges) {
+    const a = e.a, b = e.b;
+    if (!a || !b) continue;
+    const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    const k = spring * Math.min(e.weight, 8);
+    a.vx += dx * k; a.vy += dy * k; a.vz += dz * k;
+    b.vx -= dx * k; b.vy -= dy * k; b.vz -= dz * k;
+  }
+  for (const n of nodes) {
+    n.vx *= damping; n.vy *= damping; n.vz *= damping;
+    n.x += n.vx; n.y += n.vy; n.z += n.vz;
+  }
+}
+
+function build(data) {
+  for (const m of meshes) { scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+  if (lines) scene.remove(lines);
+  meshes = [];
+
+  const byId = new Map();
+  nodes = data.nodes.map((n) => {
+    const node = { ...n, x: (Math.random() - .5) * 400, y: (Math.random() - .5) * 400,
+                   z: (Math.random() - .5) * 400, vx: 0, vy: 0, vz: 0 };
+    byId.set(n.id, node);
+    return node;
+  });
+  edges = data.edges.map((e) => ({ a: byId.get(e.from_id), b: byId.get(e.to_id), weight: e.weight }))
+                    .filter((e) => e.a && e.b);
+
+  const geometry = new THREE.SphereGeometry(1, 16, 12);
+  for (const n of nodes) {
+    const size = 3 + Math.min(Math.sqrt(n.weight || 1) * 1.8, 16);
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+      color: COLORS[n.space_id] ?? 0x6b7280, emissive: COLORS[n.space_id] ?? 0x6b7280,
+      emissiveIntensity: 0.35, roughness: 0.45,
+    }));
+    mesh.scale.setScalar(size);
+    mesh.userData = n;
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+
+  lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(edges.length * 6), 3));
+  lines = new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({
+    color: 0x3a4555, transparent: true, opacity: 0.5,
+  }));
+  scene.add(lines);
+  status(`${nodes.length} people and companies · ${edges.length} connections`);
+}
+
+function render() {
+  requestAnimationFrame(render);
+  layoutStep();
+  for (const m of meshes) m.position.set(m.userData.x ?? 0, m.userData.y ?? 0, m.userData.z ?? 0);
+  for (const [i, n] of nodes.entries()) { meshes[i].position.set(n.x, n.y, n.z); meshes[i].userData = n; }
+  if (lineGeo) {
+    const p = lineGeo.attributes.position.array;
+    edges.forEach((e, i) => {
+      p[i * 6] = e.a.x; p[i * 6 + 1] = e.a.y; p[i * 6 + 2] = e.a.z;
+      p[i * 6 + 3] = e.b.x; p[i * 6 + 4] = e.b.y; p[i * 6 + 5] = e.b.z;
+    });
+    lineGeo.attributes.position.needsUpdate = true;
+  }
+  camera.position.set(
+    radius * Math.cos(pitch) * Math.sin(yaw),
+    radius * Math.sin(pitch),
+    radius * Math.cos(pitch) * Math.cos(yaw),
+  );
+  camera.lookAt(0, 0, 0);
+  renderer.render(scene, camera);
+}
+
+// ------------------------------------------------------------- interaction
+
+const raycaster = new THREE.Raycaster();
+renderer.domElement.addEventListener("click", async (e) => {
+  const pointer = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(meshes)[0];
+  if (hit) await openEntity(hit.object.userData.name);
+});
+
+async function openEntity(name) {
+  const panel = document.getElementById("panel");
+  const body = document.getElementById("panelBody");
+  body.innerHTML = "<p>Loading…</p>";
+  panel.classList.add("open");
+  try {
+    const result = await api("/tools/who_is", { method: "POST", body: JSON.stringify({ name }) });
+    const text = result.content?.[0]?.text ?? "{}";
+    let d; try { d = JSON.parse(text); } catch { body.innerHTML = `<p>${text}</p>`; return; }
+    const list = (items, render) =>
+      items?.length ? `<ul>${items.map(render).join("")}</ul>` : `<p style="color:var(--muted)">None recorded.</p>`;
+    body.innerHTML = `
+      <h2>${d.entity?.name ?? name}</h2>
+      <div class="kind">${d.entity?.kind ?? ""}</div>
+      <section><h3>Appears in</h3>${list(d.appears_in, (s) =>
+        `<li>${s.space_id} — ${s.event_count} interactions</li>`)}</section>
+      <section><h3>What we know</h3>${list(d.facts, (f) =>
+        `<li>${f.predicate}: ${f.object ?? ""} <span style="color:var(--muted)">(${Math.round(f.confidence * 100)}%)</span></li>`)}</section>
+      <section><h3>Connected to</h3>${list(d.relationships?.slice(0, 12), (r) =>
+        `<li>${r.from_name === (d.entity?.name) ? r.to_name : r.from_name} — ${r.kind}</li>`)}</section>
+      <section><h3>Recent</h3>${list(d.recent_events?.slice(0, 6), (e) =>
+        `<li><strong>${new Date(e.occurred_at).toLocaleDateString()}</strong> ${e.subject ?? e.snippet?.slice(0, 80) ?? ""}</li>`)}</section>`;
+  } catch (err) {
+    body.innerHTML = `<p>Could not load: ${err.message}</p>`;
+  }
+}
+document.getElementById("close").onclick = () =>
+  document.getElementById("panel").classList.remove("open");
+
+const active = new Set(["scottsdale", "lawrence", "personal"]);
+async function reload() {
+  status("Loading…");
+  try {
+    const data = await api(`/graph?spaces=${[...active].join(",")}&limit=400`);
+    build(data);
+  } catch (err) { status(`Error: ${err.message}`); }
+}
+for (const chip of document.querySelectorAll(".chip")) {
+  chip.onclick = () => {
+    const space = chip.dataset.space;
+    chip.classList.toggle("on");
+    active.has(space) ? active.delete(space) : active.add(space);
+    reload();
+  };
+}
+document.getElementById("find").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.value.trim()) openEntity(e.target.value.trim());
+});
+
+document.getElementById("enter").onclick = async () => {
+  token = document.getElementById("token").value.trim();
+  if (!token) return;
+  try {
+    await api("/graph?limit=1");
+  } catch {
+    alert("That token was rejected.");
+    return;
+  }
+  document.getElementById("gate").remove();
+  document.getElementById("hud").hidden = false;
+  render();
+  reload();
+};
+document.getElementById("token").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("enter").click();
+});
+</script>
+</body>
+</html>

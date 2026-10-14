@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.secrets/
+*.log
+data/
+inbox/
+.DS_Store
