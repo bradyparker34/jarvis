@@ -114,13 +114,26 @@ and per-arena projections are pushed to Supabase for the apps that need them,
 with `bitdeer` never leaving the machine. Multi-device access is solved by
 reaching the local instance, not by relocating the data.
 
-**Two machines.** Brady has a work computer holding the Bitdeer material and a
-personal computer for everything else. Splitting along that line is stronger
-than any software boundary — `bitdeer` data that is never on the personal
-machine cannot leak from it — but it changes the shape of the system, and the
-choice depends on whether the work machine is company-issued and managed.
-Unresolved; see the note below on sanctioned links, because the two questions
-are the same question.
+**Two machines.** Settled: one instance, on the personal machine, pulling the
+Bitdeer accounts over their APIs. The work computer is Bitdeer-issued, and the
+alternative considered was running a second instance on it so that the material
+never left their asset, with the personal instance querying it over the network.
+
+Brady chose the single-instance route with the trade-off stated plainly: this is
+systematic automated export of employer material onto personal hardware, which
+is the scenario `docs/RISKS.md` opens with, and it is a different act from the
+on-demand reads an assistant does today without retaining anything. He has read
+his agreement, the exposure was laid out twice, and the decision is his. It is
+recorded here so nobody re-opens it by accident, and so the reasoning is visible
+if it ever needs revisiting.
+
+Two consequences for the build. Workspace admins can usually see third-party
+OAuth grants and often block them outright, so account access may not be
+available regardless of this decision. And the sever switch now has to work
+properly, because it is the only remaining mechanism — which makes the residue
+documented in `docs/RISKS.md` (entities, identifiers, retrieval logs, artifact
+files on disk surviving `DELETE FROM spaces`) a real gap rather than a
+footnote.
 
 **Sanctioned cross-arena links.** Compartmentalisation is the hard rule, but
 some genuine connections cross arenas: the same person in two businesses, an
