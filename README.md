@@ -24,7 +24,9 @@ used to think otherwise. An agent can always answer *how do you know that*.
 separate arenas. A query that does not name a space searches everything
 shareable. Bitdeer is marked unshareable in the database, so it only answers
 when asked for by name, and a cross-space sweep can never pull it in by
-accident.
+accident. Every read path resolves scope through one function and filters on
+its result, so a new tool cannot accidentally sidestep the boundary; the tests
+probe each path with planted unshareable material to keep that true.
 
 **Decisions are graded.** Logging a decision records the context behind it and
 what you expected. Recording the outcome grades it automatically. Over a few
@@ -127,6 +129,12 @@ The schema, the ingest path, hybrid retrieval and the decision loop are tested
 end to end against real Postgres — `npm run db:test` runs those checks against
 your own database, and `db/test/smoke.sql` covers space isolation, the Bitdeer
 boundary, provenance and outcome grading in both directions.
+
+The boundary is checked at two levels, which matters because they fail
+independently: `db/test/smoke.sql` covers the SQL functions, and `npm run
+db:test` plants real unshareable material and probes every tool and the viewer
+graph for it. The second set exists because the SQL layer was correct while
+four hand-written queries beside it were not — see `docs/RISKS.md`.
 
 Not yet exercised against real volume: a multi-gigabyte Takeout mbox, and the
 iMessage reader against a large `chat.db`. Both stream rather than buffer, but

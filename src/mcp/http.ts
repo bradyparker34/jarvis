@@ -13,10 +13,11 @@
  */
 
 import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tools, callTool } from "./tools.ts";
-import { q, repoRoot } from "../lib/db.ts";
+import { tools, callTool, resolveScope, graphSnapshot } from "./tools.ts";
+import { repoRoot } from "../lib/db.ts";
 
 const port = Number(process.env.JARVIS_HTTP_PORT ?? 8787);
 const token = process.env.JARVIS_HTTP_TOKEN;
@@ -28,6 +29,14 @@ if (!token) {
   );
   process.exit(1);
 }
+
+const expected = Buffer.from(`Bearer ${token}`);
+
+/** Constant-time compare, so a wrong token leaks nothing by how fast it fails. */
+const tokenMatches = (header: string): boolean => {
+  const given = Buffer.from(header);
+  return given.length === expected.length && timingSafeEqual(given, expected);
+};
 
 const json = (res: any, code: number, body: unknown) => {
   const payload = JSON.stringify(body);
@@ -66,7 +75,7 @@ const server = createServer(async (req, res) => {
     }
 
     const auth = req.headers.authorization ?? "";
-    if (auth !== `Bearer ${token}`) return json(res, 401, { error: "unauthorized" });
+    if (!tokenMatches(auth)) return json(res, 401, { error: "unauthorized" });
 
     if (url.pathname === "/tools" && req.method === "GET") {
       return json(res, 200, tools.map(({ name, description, inputSchema }) => ({
@@ -75,28 +84,14 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === "/graph" && req.method === "GET") {
-      const spaces = url.searchParams.get("spaces")?.split(",").filter(Boolean) ?? null;
-      const limit = Number(url.searchParams.get("limit") ?? 400);
-      const [nodes, edges] = await Promise.all([
-        q(`SELECT e.id, e.name, e.kind::text,
-                  coalesce(sum(es.event_count), 0)::int AS weight,
-                  (array_agg(es.space_id ORDER BY es.event_count DESC))[1] AS space_id
-           FROM entities e
-           JOIN entity_spaces es ON es.entity_id = e.id
-           WHERE ($1::text[] IS NULL OR es.space_id = ANY($1))
-           GROUP BY e.id
-           ORDER BY weight DESC
-           LIMIT $2`, [spaces, limit]),
-        q(`SELECT from_id, to_id, kind, space_id, weight FROM edges
-           WHERE ended_at IS NULL
-             AND ($1::text[] IS NULL OR space_id IS NULL OR space_id = ANY($1))
-           ORDER BY weight DESC LIMIT $2`, [spaces, limit * 3]),
-      ]);
-      const ids = new Set(nodes.map((n: any) => n.id));
-      return json(res, 200, {
-        nodes,
-        edges: edges.filter((e: any) => ids.has(e.from_id) && ids.has(e.to_id)),
-      });
+      // This route resolved its own scope and treated "no spaces param" as
+      // "every space", so the viewer's default view — and any agent calling
+      // the bridge — rendered the Bitdeer graph. It now goes through the same
+      // resolver as the tools: omitting spaces means everything shareable.
+      const requested = url.searchParams.get("spaces")?.split(",").filter(Boolean);
+      const scope = await resolveScope(requested?.length ? { spaces: requested } : {});
+      const limit = Math.min(Number(url.searchParams.get("limit") ?? 400), 2000);
+      return json(res, 200, await graphSnapshot(scope, limit));
     }
 
     const match = url.pathname.match(/^\/tools\/([a-z_]+)$/);

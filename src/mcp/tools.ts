@@ -28,21 +28,70 @@ const fail = (message: string): ToolResult => ({
   isError: true,
 });
 
-/** Omitted spaces means "everywhere shareable", which excludes Bitdeer. */
-function scope(args: { spaces?: string[]; cross_space?: boolean }) {
-  const spaces = args.spaces?.length ? args.spaces : null;
-  const crossSpace = spaces ? (args.cross_space ?? false) : true;
-  return { spaces, crossSpace };
+/** Highest sensitivity a result may carry. 'restricted' is never readable. */
+export type Ceiling = "private" | "confidential";
+
+export type Scope = {
+  /**
+   * The spaces this call may read: validated, and already excluding
+   * unshareable spaces unless the caller named one outright. Handlers filter
+   * on this array and never look at the raw arguments again.
+   */
+  spaces: string[];
+  ceiling: Ceiling;
+  /** What the caller asked for, kept for the retrieval log. */
+  requested: string[] | null;
+  crossSpace: boolean;
+};
+
+/**
+ * The one place scope is decided.
+ *
+ * Every handler and HTTP route that reads space-scoped rows goes through this
+ * and filters on the array it returns. That is deliberate structure, not
+ * tidiness: the Bitdeer leaks this replaced were all queries that resolved
+ * scope themselves and got it wrong. who_is returned Bitdeer event bodies —
+ * including rows marked 'restricted' — even when asked for scottsdale
+ * outright, because its subquery had no space predicate at all. Handing
+ * handlers a resolved list instead of raw arguments removes the chance to
+ * forget.
+ *
+ * Unknown space ids raise out of resolve_scope() rather than resolving to an
+ * empty set, so a typo reads as an error and not as "nothing known".
+ */
+export async function resolveScope(args: {
+  spaces?: string[];
+  cross_space?: boolean;
+  include_confidential?: boolean;
+}): Promise<Scope> {
+  const requested = args.spaces?.length ? args.spaces : null;
+  // Behaviour preserved exactly as shipped: omitting spaces sweeps everything
+  // shareable, and naming spaces reads those. cross_space is recorded but does
+  // not currently narrow a named list — see the note on the argument below.
+  const crossSpace = requested ? (args.cross_space ?? false) : true;
+
+  const row = await one<{ spaces: string[] | null }>(
+    `SELECT resolve_scope($1, $2) AS spaces`,
+    [requested, crossSpace],
+  );
+
+  return {
+    spaces: row?.spaces ?? [],
+    ceiling: args.include_confidential === false ? "private" : "confidential",
+    requested,
+    crossSpace,
+  };
 }
 
 async function logRetrieval(
-  caller: string, query: string | null, spaces: string[] | null,
-  crossSpace: boolean, ids: string[], ms: number,
+  caller: string, query: string | null, scope: Scope, ids: string[], ms: number,
 ) {
   await q(
     `INSERT INTO retrievals (caller, query, spaces, cross_space, result_ids, result_count, latency_ms)
      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [caller, query, spaces, crossSpace, ids, ids.length, ms],
+    // Log what was actually read, not what was asked for: when the two differ
+    // the resolved set is the one that explains the answer.
+    [caller, query, scope.spaces, scope.crossSpace, ids, ids.length, ms],
   ).catch(() => {});
 }
 
@@ -61,7 +110,14 @@ const spaceArg = {
   },
   cross_space: {
     type: "boolean",
-    description: "Allow results from several spaces at once. Ignored when spaces is omitted.",
+    // Honest description of current behaviour. The old text claimed the
+    // opposite of what the code does, and tightening it is an API change that
+    // needs a decision, so it is recorded rather than silently altered.
+    description: "Recorded on the retrieval log. Does not currently narrow a named spaces list: naming several spaces reads all of them.",
+  },
+  include_confidential: {
+    type: "boolean",
+    description: "Include material marked confidential, such as employer correspondence. Default true; set false when drafting anything that leaves Brady's hands. Material marked restricted is never returned either way.",
   },
 };
 
@@ -94,25 +150,22 @@ export const tools: Tool[] = [
         ...spaceArg,
         limit: { type: "number", description: "Max results, default 20." },
         since: { type: "string", description: "ISO date; only return things after this." },
-        include_confidential: {
-          type: "boolean",
-          description: "Include material marked confidential, such as employer correspondence. Default true; set false when drafting anything that leaves Brady's hands.",
-        },
       },
       required: ["query"],
     },
     handler: async (args, caller) => {
       const started = Date.now();
-      const { spaces, crossSpace } = scope(args);
-      const ceiling = args.include_confidential === false ? "private" : "confidential";
+      const scope = await resolveScope(args);
       const vector = (await hasVectors()) ? await embedOne(args.query) : null;
 
+      // The resolved list is passed as the space argument, so readable_spaces()
+      // inside these functions returns it verbatim. Scope is decided once.
       const rows = await q(
-        `SELECT * FROM recall($1, $2::vector, $3, $4, $5, $6, $7)`,
+        `SELECT * FROM recall($1, $2::vector, $3, false, $4, $5, $6)`,
         [
           args.query,
           vector ? toVector(vector) : null,
-          spaces, crossSpace, args.limit ?? 20, ceiling,
+          scope.spaces, args.limit ?? 20, scope.ceiling,
           args.since ?? null,
         ],
       ).catch(async (err) => {
@@ -120,11 +173,11 @@ export const tools: Tool[] = [
         if (!/function recall|does not exist|type "vector"/i.test(String(err))) throw err;
         return q(`SELECT 'event' AS object_type, id AS object_id, space_id, occurred_at,
                          subject AS title, left(coalesce(body,''), 400) AS snippet, score
-                  FROM search_events($1, $2, $3, $4, $5)`,
-          [args.query, spaces, crossSpace, args.limit ?? 20, ceiling]);
+                  FROM search_events($1, $2, false, $3, $4)`,
+          [args.query, scope.spaces, args.limit ?? 20, scope.ceiling]);
       });
 
-      await logRetrieval(caller, args.query, spaces, crossSpace,
+      await logRetrieval(caller, args.query, scope,
         rows.map((r: any) => r.object_id), Date.now() - started);
 
       if (!rows.length) {
@@ -148,7 +201,7 @@ export const tools: Tool[] = [
     },
     handler: async (args, caller) => {
       const started = Date.now();
-      const { spaces, crossSpace } = scope(args);
+      const scope = await resolveScope(args);
       const needle = String(args.name).trim();
 
       const entity = await one<{ id: string; name: string; kind: string; summary: string | null; aliases: string[] }>(
@@ -163,9 +216,15 @@ export const tools: Tool[] = [
         [needle],
       );
       if (!entity) {
+        // Only suggest people the caller could actually read about, or the
+        // "close names" list becomes a directory of the spaces it cannot see.
         const near = await q(
-          `SELECT name FROM entities WHERE search_tsv @@ plainto_tsquery('english', $1) LIMIT 5`,
-          [needle],
+          `SELECT DISTINCT e.name FROM entities e
+             JOIN entity_spaces es ON es.entity_id = e.id
+            WHERE e.search_tsv @@ plainto_tsquery('english', $1)
+              AND es.space_id = ANY($2)
+            LIMIT 5`,
+          [needle, scope.spaces],
         );
         return ok(near.length
           ? `No exact match for "${needle}". Close names: ${near.map((n: any) => n.name).join(", ")}`
@@ -173,19 +232,37 @@ export const tools: Tool[] = [
       }
 
       const [facts, links, recent, spacesIn] = await Promise.all([
-        q(`SELECT * FROM entity_dossier($1, $2, $3)`, [entity.id, spaces, crossSpace]),
-        q(`SELECT * FROM graph_neighbors($1, 1, $2, $3, 25)`, [entity.id, spaces, crossSpace]),
+        q(`SELECT * FROM entity_dossier($1, $2, false, $3)`,
+          [entity.id, scope.spaces, scope.ceiling]),
+        q(`SELECT * FROM graph_neighbors($1, 1, $2, false, 25)`, [entity.id, scope.spaces]),
+        // This is where Bitdeer leaked: no space predicate and no sensitivity
+        // ceiling, so every caller got the last ten events involving this
+        // person from every space, confidential and restricted included.
         q(`SELECT e.id, e.space_id, e.kind::text, e.occurred_at, e.subject,
                   left(coalesce(e.body,''), 300) AS snippet
            FROM events e
            JOIN event_participants p ON p.event_id = e.id
            WHERE p.entity_id = $1
-           ORDER BY e.occurred_at DESC LIMIT 10`, [entity.id]),
+             AND e.space_id = ANY($2)
+             AND e.sensitivity <= $3::sensitivity
+           ORDER BY e.occurred_at DESC LIMIT 10`, [entity.id, scope.spaces, scope.ceiling]),
+        // Participation counts and last-seen dates are themselves disclosure:
+        // "appears in bitdeer, 412 events, last week" says plenty on its own.
         q(`SELECT space_id, role, event_count, last_seen_at
-           FROM entity_spaces WHERE entity_id = $1 ORDER BY event_count DESC`, [entity.id]),
+           FROM entity_spaces
+           WHERE entity_id = $1 AND space_id = ANY($2)
+           ORDER BY event_count DESC`, [entity.id, scope.spaces]),
       ]);
 
-      await logRetrieval(caller, `who_is:${needle}`, spaces, crossSpace, [entity.id], Date.now() - started);
+      // Entities are global by design, so a lookup can resolve someone this
+      // caller may know nothing about. Confirming they exist is a small leak of
+      // its own, so when nothing readable comes back, answer as if unknown.
+      if (!facts.length && !recent.length && !spacesIn.length && !links.length) {
+        await logRetrieval(caller, `who_is:${needle}`, scope, [], Date.now() - started);
+        return ok(`Nothing readable about "${needle}" in ${scope.spaces.join(", ") || "any space"}. If this should exist, the relevant space may need naming explicitly.`);
+      }
+
+      await logRetrieval(caller, `who_is:${needle}`, scope, [entity.id], Date.now() - started);
       return ok({ entity, appears_in: spacesIn, facts, relationships: links, recent_events: recent });
     },
   },
@@ -205,14 +282,14 @@ export const tools: Tool[] = [
       },
     },
     handler: async (args, caller) => {
-      const { spaces, crossSpace } = scope(args);
+      const started = Date.now();
+      const scope = await resolveScope(args);
       const rows = await q(
-        `WITH allowed AS (SELECT unnest(readable_spaces($1, $2)) AS s),
-              target AS (
+        `WITH target AS (
                 SELECT e.id FROM entities e
                 LEFT JOIN identifiers i ON i.entity_id = e.id
-                WHERE $3::text IS NOT NULL
-                  AND (lower(e.name) = lower($3) OR e.aliases @> ARRAY[$3] OR lower(i.value) = lower($3))
+                WHERE $2::text IS NOT NULL
+                  AND (lower(e.name) = lower($2) OR e.aliases @> ARRAY[$2] OR lower(i.value) = lower($2))
                 LIMIT 1
               )
          SELECT ev.id, ev.space_id, ev.kind::text, ev.direction::text, ev.occurred_at,
@@ -220,17 +297,21 @@ export const tools: Tool[] = [
                 (SELECT array_agg(en.name) FROM event_participants p
                  JOIN entities en ON en.id = p.entity_id WHERE p.event_id = ev.id) AS people
          FROM events ev
-         JOIN allowed a ON a.s = ev.space_id
-         WHERE ev.occurred_at >= coalesce($4::timestamptz, now() - interval '30 days')
-           AND ev.occurred_at <= coalesce($5::timestamptz, now())
+         WHERE ev.space_id = ANY($1)
+           AND ev.sensitivity <= $6::sensitivity
+           AND ev.occurred_at >= coalesce($3::timestamptz, now() - interval '30 days')
+           AND ev.occurred_at <= coalesce($4::timestamptz, now())
            AND (NOT EXISTS (SELECT 1 FROM target)
                 OR EXISTS (SELECT 1 FROM event_participants p
                            WHERE p.event_id = ev.id AND p.entity_id = (SELECT id FROM target)))
          ORDER BY ev.occurred_at DESC
-         LIMIT $6`,
-        [spaces, crossSpace, args.entity ?? null, args.since ?? null, args.until ?? null, args.limit ?? 50],
+         LIMIT $5`,
+        [
+          scope.spaces, args.entity ?? null, args.since ?? null,
+          args.until ?? null, args.limit ?? 50, scope.ceiling,
+        ],
       );
-      await logRetrieval(caller, "timeline", spaces, crossSpace, rows.map((r: any) => r.id), 0);
+      await logRetrieval(caller, "timeline", scope, rows.map((r: any) => r.id), Date.now() - started);
       return ok(rows);
     },
   },
@@ -248,8 +329,9 @@ export const tools: Tool[] = [
       },
       required: ["name"],
     },
-    handler: async (args) => {
-      const { spaces, crossSpace } = scope(args);
+    handler: async (args, caller) => {
+      const started = Date.now();
+      const scope = await resolveScope(args);
       const entity = await one<{ id: string }>(
         `SELECT e.id FROM entities e LEFT JOIN identifiers i ON i.entity_id = e.id
          WHERE lower(e.name) = lower($1) OR e.aliases @> ARRAY[$1] OR lower(i.value) = lower($1) LIMIT 1`,
@@ -257,8 +339,13 @@ export const tools: Tool[] = [
       );
       if (!entity) return fail(`No one called "${args.name}" in Jarvis.`);
       const depth = Math.min(Math.max(Number(args.depth ?? 2), 1), 3);
-      return ok(await q(`SELECT * FROM graph_neighbors($1,$2,$3,$4,200)`,
-        [entity.id, depth, spaces, crossSpace]));
+      const rows = await q(`SELECT * FROM graph_neighbors($1,$2,$3,false,200)`,
+        [entity.id, depth, scope.spaces]);
+      // graph was the one read tool that logged nothing. The retrieval log is
+      // how "why did it say that" gets answered six weeks later.
+      await logRetrieval(caller, `graph:${args.name}`, scope,
+        rows.map((r: any) => r.to_id), Date.now() - started);
+      return ok(rows);
     },
   },
 
@@ -404,21 +491,32 @@ export const tools: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        space: { type: "string", description: "Optional: limit to one space." },
+        space: {
+          type: "string",
+          description: "Optional: limit to one space. Omit to review everything shareable; name bitdeer to include it.",
+        },
       },
     },
-    handler: async (args) => {
+    handler: async (args, caller) => {
+      const started = Date.now();
+      // Unscoped review used to read every space, so Bitdeer decision titles,
+      // chosen terms and stakes came back to any caller that asked for none.
+      const scope = await resolveScope(args.space ? { spaces: [String(args.space)] } : {});
+
       const [scorecard, calib, loops, recent] = await Promise.all([
-        q(`SELECT * FROM decision_scorecard WHERE ($1::text IS NULL OR space_id = $1)`, [args.space ?? null]),
-        q(`SELECT * FROM calibration WHERE ($1::text IS NULL OR space_id = $1)`, [args.space ?? null]),
-        q(`SELECT * FROM open_loops WHERE ($1::text IS NULL OR space_id = $1) LIMIT 20`, [args.space ?? null]),
+        q(`SELECT * FROM decision_scorecard WHERE space_id = ANY($1)`, [scope.spaces]),
+        q(`SELECT * FROM calibration WHERE space_id = ANY($1)`, [scope.spaces]),
+        q(`SELECT * FROM open_loops WHERE space_id = ANY($1) LIMIT 20`, [scope.spaces]),
         q(`SELECT d.id, d.space_id, d.title, d.chosen, d.confidence, d.stakes_usd,
                   o.metric, o.predicted_value, o.actual_value, o.verdict::text
            FROM decisions d JOIN outcomes o ON o.decision_id = d.id
-           WHERE ($1::text IS NULL OR d.space_id = $1)
-           ORDER BY o.observed_at DESC LIMIT 15`, [args.space ?? null]),
+           WHERE d.space_id = ANY($1)
+           ORDER BY o.observed_at DESC LIMIT 15`, [scope.spaces]),
       ]);
+
+      await logRetrieval(caller, "review", scope, recent.map((r: any) => r.id), Date.now() - started);
       return ok({
+        reviewed_spaces: scope.spaces,
         scorecard,
         calibration: calib,
         overdue_for_a_verdict: loops,
@@ -429,6 +527,39 @@ export const tools: Tool[] = [
     },
   },
 ];
+
+/**
+ * Nodes and edges for the viewer.
+ *
+ * This lives here rather than inline in the HTTP route for the same reason the
+ * resolver does: the route's own copy of this query was the fourth leak, and a
+ * query that sits next to the chokepoint and takes a resolved Scope cannot
+ * quietly grow its own scope rules again. It is also testable without booting
+ * a server, which is how it gets checked from now on.
+ */
+export async function graphSnapshot(scope: Scope, limit = 400) {
+  const [nodes, edges] = await Promise.all([
+    q(`SELECT e.id, e.name, e.kind::text,
+              coalesce(sum(es.event_count), 0)::int AS weight,
+              (array_agg(es.space_id ORDER BY es.event_count DESC))[1] AS space_id
+       FROM entities e
+       JOIN entity_spaces es ON es.entity_id = e.id
+       WHERE es.space_id = ANY($1)
+       GROUP BY e.id
+       ORDER BY weight DESC
+       LIMIT $2`, [scope.spaces, limit]),
+    q(`SELECT from_id, to_id, kind, space_id, weight FROM edges
+       WHERE ended_at IS NULL
+         AND (space_id IS NULL OR space_id = ANY($1))
+       ORDER BY weight DESC LIMIT $2`, [scope.spaces, limit * 3]),
+  ]);
+  const ids = new Set(nodes.map((n: any) => n.id));
+  return {
+    spaces: scope.spaces,
+    nodes,
+    edges: edges.filter((e: any) => ids.has(e.from_id) && ids.has(e.to_id)),
+  };
+}
 
 export const toolMap = new Map(tools.map((t) => [t.name, t]));
 

@@ -21,12 +21,50 @@ own is the highest-exposure thing this system can do.
 **What the system does about it.** The `bitdeer` space is created with
 `shareable = false` and `default_sensitivity = 'confidential'`. Cross-space
 searches cannot reach it. Agents must name it explicitly. Setting
-`include_confidential: false` on a `recall` call keeps it out of anything being
-drafted for an outside reader.
+`include_confidential: false` on a read keeps it out of anything being drafted
+for an outside reader, and material marked `restricted` is never returned to
+any caller at all.
+
+**How that is actually enforced.** Every read path resolves its scope through
+one function — `resolveScope` in `src/mcp/tools.ts`, over `resolve_scope()` in
+the database — and then filters on the list it returns. Handlers are given a
+resolved space list rather than the caller's raw arguments, specifically so
+that a new tool cannot forget to filter.
+
+That structure exists because the earlier version did not have it, and four
+read paths got it wrong: `who_is` returned Bitdeer event bodies — including
+`restricted` ones — even when asked for one other space by name; `GET /graph`
+rendered the whole graph whenever the `spaces` parameter was omitted, which was
+the viewer's default view; an unscoped `review` returned Bitdeer decision
+titles, terms and stakes. The SQL functions were correct throughout; the
+hand-written queries beside them were not. `npm run db:test` now probes every
+read path with planted unshareable material, so the next one that forgets fails
+a test instead of leaking quietly.
+
+**Embeddings and third parties.** `EMBED_PROVIDER=local` keeps everything on
+this machine. Setting it to `openai` sends row text to OpenAI, so the embed
+worker refuses to run at all while anything confidential, restricted, or in an
+unshareable space is waiting to be embedded. `jarvis embed
+--allow-withholding` proceeds with the exportable rows only and reports what it
+held back. Note that the *query* you search with is still sent to the provider
+on every `recall`, which is reason enough to leave this on `local`.
 
 **The sever switch.** `DELETE FROM spaces WHERE id = 'bitdeer';` cascades to
-every event, claim, edge and embedding in that space. One statement, no
-migration.
+every event, claim, edge, decision and embedding in that space. One statement,
+no migration.
+
+It is not a complete erase, and it is worth knowing exactly what survives:
+
+- `entities` and `identifiers` have no space column, so every Bitdeer-only
+  counterparty's name, aliases, email addresses and phone numbers remain. The
+  content is gone; the address book of who the counterparties were is not.
+- `retrievals` rows survive with their `query` text and `spaces` array, so the
+  log of what was asked about that space outlives the space.
+- `artifacts` rows cascade, but the files they point at on disk do not. Only
+  the index is removed.
+
+Closing those is a migration that has not been written yet. Until it is, treat
+the sever switch as "removes the material, leaves the map of it".
 
 **What it cannot do.** None of this changes what your agreement says. Check it.
 
