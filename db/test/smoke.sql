@@ -88,6 +88,33 @@ SELECT CASE WHEN count(*) >= 2 THEN 'PASS' ELSE 'FAIL' END
        || ' graph walk reaches two hops'
 FROM graph_neighbors('11111111-1111-1111-1111-111111111111', 2, ARRAY['scottsdale']);
 
+-- ------------------------------------------------------------ scope resolver
+
+-- Same contract as readable_spaces for the cases that already worked.
+SELECT CASE WHEN NOT ('bitdeer' = ANY(resolve_scope(NULL, true))) THEN 'PASS' ELSE 'FAIL' END
+       || ' resolve_scope omits unshareable Bitdeer from a cross-space sweep';
+
+SELECT CASE WHEN resolve_scope(ARRAY['bitdeer'], false) = ARRAY['bitdeer'] THEN 'PASS' ELSE 'FAIL' END
+       || ' resolve_scope passes through a space named outright';
+
+-- The addition: a typo must raise rather than resolve to an empty set. An
+-- empty set reads downstream as "nothing known about this person", which is
+-- indistinguishable from the truth and worse than an error.
+DO $unknown$
+BEGIN
+  PERFORM resolve_scope(ARRAY['scotsdale'], false);
+  RAISE NOTICE 'FAIL resolve_scope rejects an unknown space id';
+EXCEPTION WHEN invalid_parameter_value THEN
+  RAISE NOTICE 'PASS resolve_scope rejects an unknown space id';
+END $unknown$;
+
+-- Nothing confidential by construction may be handed to a remote service.
+SELECT CASE WHEN NOT ('bitdeer' = ANY(exportable_spaces())) THEN 'PASS' ELSE 'FAIL' END
+       || ' exportable_spaces excludes Bitdeer';
+
+SELECT CASE WHEN 'scottsdale' = ANY(exportable_spaces()) THEN 'PASS' ELSE 'FAIL' END
+       || ' exportable_spaces includes an ordinary private space';
+
 -- --------------------------------------------------- decision/outcome loop
 
 INSERT INTO decisions (id, space_id, title, question, chosen, status, decided_by,

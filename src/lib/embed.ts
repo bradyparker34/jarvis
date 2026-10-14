@@ -45,8 +45,27 @@ function loadOpenAI(): Embedder {
   };
 }
 
+export function embedProvider(): string {
+  return process.env.EMBED_PROVIDER ?? "local";
+}
+
 export function embeddingsEnabled(): boolean {
-  return (process.env.EMBED_PROVIDER ?? "local") !== "none";
+  return embedProvider() !== "none";
+}
+
+/**
+ * Whether embedding happens entirely on this machine.
+ *
+ * This is the gate on what may be embedded at all. The provider switch is one
+ * env var, and before it was checked the embed worker drained the whole
+ * backlog — which includes Bitdeer 'confidential' rows and anything marked
+ * 'restricted' — straight to a third party. A read-path leak shows ten emails
+ * to one model prompt; this one would have shipped the archive, on a schedule,
+ * with nobody watching. The caller refuses rather than silently skipping, so
+ * the choice stays conscious.
+ */
+export function embeddingIsLocal(): boolean {
+  return embedProvider() === "local";
 }
 
 /**

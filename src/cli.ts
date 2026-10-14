@@ -11,7 +11,7 @@
  */
 
 import { q, one, migrate, hasVectors, close, repoRoot } from "./lib/db.ts";
-import { embed, toVector, embeddingsEnabled } from "./lib/embed.ts";
+import { embed, toVector, embeddingsEnabled, embeddingIsLocal, embedProvider } from "./lib/embed.ts";
 import { ingestDropFolder } from "./adapters/drop.ts";
 import { ingestIMessage } from "./adapters/imessage.ts";
 import { inferEdgesFromParticipation } from "./lib/ingest.ts";
@@ -71,11 +71,45 @@ async function cmdEmbed() {
   }
   const model = process.env.EMBED_MODEL ?? "all-MiniLM-L6-v2";
   const batchSize = Number(flag("batch") ?? 64);
+  const local = embeddingIsLocal();
   let total = 0;
+  let withheld = 0;
+
+  // A remote provider may only see rows that are safe to send off this
+  // machine: 'open' or 'private', and from a space that is not confidential by
+  // construction. Everything else is refused up front rather than skipped
+  // quietly, because a silent skip means Bitdeer never becomes searchable and
+  // nobody finds out why.
+  if (!local) {
+    const [sensitive] = await q<{ n: number }>(
+      `SELECT count(*)::int AS n FROM embedding_backlog b
+         WHERE NOT (b.sensitivity <= 'private' AND b.space_id = ANY(exportable_spaces()))`,
+    );
+    const n = sensitive?.n ?? 0;
+    if (n > 0 && !has("allow-withholding")) {
+      console.error(
+        `EMBED_PROVIDER=${embedProvider()} sends text to a third party, and ${n} row(s) waiting to be\n` +
+        `embedded are confidential, restricted, or in a space marked unshareable.\n\n` +
+        `Refusing the whole run. Pick one:\n` +
+        `  EMBED_PROVIDER=local        embed everything on this machine (recommended)\n` +
+        `  jarvis embed --allow-withholding   embed only the exportable rows, leave the rest unembedded\n\n` +
+        `See docs/RISKS.md.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    withheld = n;
+  }
 
   for (;;) {
+    // The filter lives in the query, not in the loop below, so a future caller
+    // cannot reintroduce the leak by forgetting to check.
     const rows = await q<{ object_type: string; object_id: string; space_id: string; sensitivity: string; content: string }>(
-      `SELECT * FROM embedding_backlog LIMIT $1`, [batchSize],
+      `SELECT * FROM embedding_backlog b
+         WHERE $2::boolean
+            OR (b.sensitivity <= 'private' AND b.space_id = ANY(exportable_spaces()))
+         LIMIT $1`,
+      [batchSize, local],
     );
     if (!rows.length) break;
 
@@ -99,6 +133,12 @@ async function cmdEmbed() {
     process.stdout.write(`\rembedded ${total}`);
   }
   console.log(`\ndone: ${total} embedded with ${model}`);
+  if (withheld) {
+    console.log(
+      `withheld from ${embedProvider()}: ${withheld} confidential/restricted/unshareable row(s).\n` +
+      `They stay keyword-searchable only. Switch to EMBED_PROVIDER=local to include them.`,
+    );
+  }
 }
 
 async function cmdDoctor() {
@@ -190,14 +230,100 @@ async function cmdTest() {
   check("record_outcome grades a faster result as better",
     JSON.parse(outcome.content[0]!.text).verdict === "better");
 
-  const bitdeer = await callTool("recall", { query: "the" }, "selftest");
-  check("a default search never reaches Bitdeer",
-    !/"space_id": "bitdeer"/.test(bitdeer.content[0]!.text));
+  // ------------------------------------------------- the Bitdeer boundary
+  //
+  // The old check below only exercised `recall`, which was never the problem:
+  // it goes through a SQL function that honours the boundary. The leaks were in
+  // handlers that wrote their own queries — who_is returned Bitdeer bodies even
+  // when asked for one other space by name. So these checks plant real
+  // unshareable material and probe every read path for it.
+  //
+  // Everything planted here is marked and removed in the finally block below.
+  const { resolveScope, graphSnapshot } = await import("./mcp/tools.ts");
+  // Two separate tokens on purpose. `canary` is the search term, and the
+  // not-found reply quotes the search term back, so probing for it would
+  // report a leak on an empty result. The secrets only ever appear inside row
+  // bodies and titles, so finding one means a row actually came back.
+  const canary = `${marker}-CANARY`;
+  const secret = `${marker}-CONFIDENTIAL-BODY`;
+  const restrictedSecret = `${marker}-RESTRICTED-BODY`;
 
-  // Clean up.
-  await q(`DELETE FROM decisions WHERE title = $1`, [marker]);
-  await q(`DELETE FROM events WHERE external_id = $1`, [marker]);
-  await q(`DELETE FROM entities WHERE name = 'Self Test'`);
+  try {
+    const source = await one<{ id: string }>(
+      `INSERT INTO sources (space_id, kind, handle) VALUES ('bitdeer','manual',$1)
+       ON CONFLICT (kind, handle, space_id) DO UPDATE SET enabled = sources.enabled
+       RETURNING id`, [marker],
+    );
+    for (const [n, sensitivity, body] of [
+      ["c", "confidential", secret],
+      ["r", "restricted", restrictedSecret],
+    ] as const) {
+      await ingestEvent({
+        spaceId: "bitdeer", sourceId: source!.id, kind: "email", occurredAt: new Date(),
+        externalId: `${marker}-${n}`, subject: `${canary} ${n}`,
+        body: `${canary} ${body} must never leave the bitdeer space`,
+        sensitivity,
+        participants: [{ kind: "email", value: `${marker}@example.com`, name: "Self Test" }],
+      });
+    }
+    await q(
+      `INSERT INTO decisions (space_id, title, question, chosen, status, decided_by, decided_at)
+       VALUES ('bitdeer',$1,'self test?','YES','executed','selftest', now())`, [secret],
+    );
+
+    const leaks = (result: { content: { text: string }[] }) =>
+      result.content[0]!.text.includes(secret) || result.content[0]!.text.includes(restrictedSecret);
+
+    check("recall at default scope never reaches Bitdeer",
+      !leaks(await callTool("recall", { query: canary }, "selftest")));
+    check("who_is at default scope never reaches Bitdeer",
+      !leaks(await callTool("who_is", { name: `${marker}@example.com` }, "selftest")));
+    check("who_is scoped to one space never reaches another",
+      !leaks(await callTool("who_is", { name: `${marker}@example.com`, spaces: ["personal"] }, "selftest")));
+    check("timeline at default scope never reaches Bitdeer",
+      !leaks(await callTool("timeline", {}, "selftest")));
+    check("review with no space never reaches Bitdeer",
+      !leaks(await callTool("review", {}, "selftest")));
+    check("the viewer graph at default scope never reaches Bitdeer",
+      !JSON.stringify(await graphSnapshot(await resolveScope({}))).includes("bitdeer"));
+
+    // Named outright, it must still answer — that is the documented escape
+    // hatch, and a boundary that cannot be opened deliberately is just a bug.
+    check("Bitdeer still answers when named explicitly",
+      leaks(await callTool("recall", { query: canary, spaces: ["bitdeer"] }, "selftest")));
+
+    // Restricted is the one level that is never readable, by any caller.
+    const named = await callTool("recall", { query: canary, spaces: ["bitdeer"] }, "selftest");
+    check("restricted material is withheld even from an explicit Bitdeer read",
+      named.content[0]!.text.includes(secret)
+      && !named.content[0]!.text.includes(restrictedSecret));
+
+    // A mistyped space must raise, not resolve to an empty set that reads as
+    // "nothing known".
+    const typo = await callTool("recall", { query: canary, spaces: ["bitdeerr"] }, "selftest");
+    check("an unknown space id is an error, not silence",
+      Boolean(typo.isError) && typo.content[0]!.text.includes("unknown space"));
+
+    // Blending arenas has to be asked for. A single named space does not.
+    const blended = await callTool("recall",
+      { query: canary, spaces: ["bitdeer", "personal"] }, "selftest");
+    check("naming two spaces without cross_space is refused",
+      Boolean(blended.isError) && blended.content[0]!.text.includes("cross_space"));
+
+    const deliberate = await callTool("recall",
+      { query: canary, spaces: ["bitdeer", "personal"], cross_space: true }, "selftest");
+    check("naming two spaces with cross_space works",
+      !deliberate.isError && deliberate.content[0]!.text.includes(secret));
+
+    const single = await callTool("recall", { query: canary, spaces: ["personal"] }, "selftest");
+    check("a single named space needs no cross_space", !single.isError);
+  } finally {
+    // Clean up, including anything planted before a check threw.
+    await q(`DELETE FROM decisions WHERE title IN ($1, $2)`, [marker, secret]);
+    await q(`DELETE FROM events WHERE external_id LIKE $1`, [`${marker}%`]);
+    await q(`DELETE FROM sources WHERE handle = $1`, [marker]);
+    await q(`DELETE FROM entities WHERE name = 'Self Test'`);
+  }
 
   console.log(failures ? `\n${failures} failed` : "\nall checks passed");
   process.exitCode = failures ? 1 : 0;
