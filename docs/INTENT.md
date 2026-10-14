@@ -114,13 +114,34 @@ and per-arena projections are pushed to Supabase for the apps that need them,
 with `bitdeer` never leaving the machine. Multi-device access is solved by
 reaching the local instance, not by relocating the data.
 
-**Claim extraction over `bitdeer`.** Still open; the question was asked badly
-the first time. Claim extraction means a model reads each ingested message and
-distils durable facts from it — "pays by wire", "needs 30 days", "approves above
-15%" — storing each with a pointer back to the message it came from. It is
-unrelated to where the database lives. The question is whether a model may read
-Bitdeer material in order to do that. The recommendation is yes, with a local
-model only, and the restriction not overridable by configuration.
+**Two machines.** Brady has a work computer holding the Bitdeer material and a
+personal computer for everything else. Splitting along that line is stronger
+than any software boundary — `bitdeer` data that is never on the personal
+machine cannot leak from it — but it changes the shape of the system, and the
+choice depends on whether the work machine is company-issued and managed.
+Unresolved; see the note below on sanctioned links, because the two questions
+are the same question.
+
+**Sanctioned cross-arena links.** Compartmentalisation is the hard rule, but
+some genuine connections cross arenas: the same person in two businesses, an
+introduction that came from one and paid off in another. Those are legitimate
+and should be expressible. What must not happen is content bleeding — Bitdeer
+terms surfacing while drafting for Lawrence.
+
+The current model half-covers this. Entities are global, so identity already
+spans arenas; `entity_spaces` records where someone appears; and claims, events
+and the dossier are space-filtered, so facts stay put. What is missing is a
+deliberate, recorded link: a way to say "these two things are connected, here is
+why" that an agent can see and reason about without that link becoming a channel
+for the underlying material. A connection should be an assertion with a reason
+and an author, not a side effect of a query.
+
+**Claim extraction over `bitdeer`.** Settled: yes. A model may read Bitdeer
+material to distil durable facts from it, because that is what produces the
+compounding intelligence the system exists for. The model must be local, and
+that restriction is not overridable by configuration — the same mistake as the
+embedding provider switch, which shipped as one env var away from sending the
+archive to a third party.
 
 **Per-agent scope.** With more than one agent holding a bridge token, any caller
 can name any space. Scoping tokens per agent is not built and probably should be
