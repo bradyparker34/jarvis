@@ -3,6 +3,7 @@
  * jarvis <command>
  *
  *   migrate    create or update the schema
+ *   connect    authorise a mailbox into one space
  *   ingest     pull in everything waiting in inbox/, plus iMessage if asked
  *   embed      compute embeddings for anything new (safe to re-run)
  *   serve      start the HTTP bridge
@@ -14,7 +15,9 @@ import { q, one, migrate, hasVectors, close, repoRoot } from "./lib/db.ts";
 import { embed, toVector, embeddingsEnabled, embeddingIsLocal, embedProvider } from "./lib/embed.ts";
 import { ingestDropFolder } from "./adapters/drop.ts";
 import { ingestIMessage } from "./adapters/imessage.ts";
-import { inferEdgesFromParticipation } from "./lib/ingest.ts";
+import { inferEdgesFromParticipation, getOrCreateSource } from "./lib/ingest.ts";
+import { syncGmail } from "./adapters/gmail.ts";
+import { authorize, whoami } from "./lib/google.ts";
 import { suggestMerges } from "./lib/identity.ts";
 import { join } from "node:path";
 
@@ -59,9 +62,107 @@ async function cmdIngest() {
     }
   }
 
+  // Live mail. Each connected mailbox syncs into the one space it was
+  // connected to; --handle narrows to a single account.
+  if (has("google") || has("gmail")) {
+    const only = flag("handle");
+    const accounts = await q<{ space_id: string; handle: string }>(
+      `SELECT space_id, handle FROM sources
+        WHERE kind = 'gmail' AND enabled
+          AND ($1::text IS NULL OR handle = $1)
+        ORDER BY space_id, handle`,
+      [only ?? null],
+    );
+    if (!accounts.length) {
+      console.log(only
+        ? `${only} is not connected. Run: jarvis connect --google --handle ${only} --space <space>`
+        : "no Google accounts connected yet. Run: jarvis connect --google --handle <email> --space <space>");
+    }
+    for (const account of accounts) {
+      try {
+        const out = await syncGmail({
+          handle: account.handle,
+          spaceId: account.space_id,
+          myAddresses: [account.handle, ...addresses],
+          sinceDays: Number(flag("days") ?? 30),
+          max: Number(flag("max") ?? 2000),
+        });
+        console.log(
+          `gmail ${out.handle} -> ${out.space} (${out.mode}): ${out.created} new of ${out.seen}` +
+          (out.errors ? `, ${out.errors} failed` : ""),
+        );
+      } catch (err) {
+        console.error(`gmail ${account.handle} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
   const edges = await inferEdgesFromParticipation();
   console.log(`relationships refreshed: ${edges}`);
   if (embeddingsEnabled()) console.log("run `jarvis embed` to make the new material semantically searchable");
+}
+
+/**
+ * Authorise one mailbox into one space.
+ *
+ * The space is fixed at connect time and recorded on the source, so a mailbox
+ * can only ever write into the arena it was connected to. That is the boundary
+ * doing real work: no downstream query filter can put material back in the
+ * right space once it has landed in the wrong one.
+ */
+async function cmdConnect() {
+  if (!has("google") && !has("gmail")) {
+    console.log("usage: jarvis connect --google --handle <email> --space <bitdeer|lawrence|scottsdale|personal>");
+    process.exitCode = 1;
+    return;
+  }
+  const handle = flag("handle");
+  const space = flag("space");
+  if (!handle || !space) {
+    console.error("both --handle <email> and --space <space> are required.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const known = await one<{ id: string; label: string }>(
+    `SELECT id, label FROM spaces WHERE id = $1`, [space],
+  );
+  if (!known) {
+    const all = await q<{ id: string }>(`SELECT id FROM spaces ORDER BY id`);
+    console.error(`unknown space '${space}'. Valid: ${all.map((s) => s.id).join(", ")}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const existing = await one<{ space_id: string }>(
+    `SELECT space_id FROM sources WHERE kind = 'gmail' AND handle = $1 LIMIT 1`, [handle],
+  );
+  if (existing && existing.space_id !== space) {
+    console.error(
+      `${handle} is already connected to '${existing.space_id}'. One mailbox belongs to one arena;\n` +
+      `moving it would leave its existing mail in the old space. Disconnect it first if that is really the intent.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const token = await authorize({ handle });
+  // Catch the easy and expensive mistake: signing in as the wrong account at
+  // the consent screen, which would file one business's mail under another.
+  const actual = await whoami(handle);
+  if (actual && actual.toLowerCase() !== handle.toLowerCase()) {
+    console.error(
+      `\nAuthorised account is ${actual}, not ${handle}. The token has been saved under ${handle}\n` +
+      `and would file ${actual}'s mail into '${space}'. Re-run connect and sign in as ${handle}.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  await getOrCreateSource(space, "gmail", handle);
+  console.log(`\nconnected ${token.handle} -> ${known.label} (${space})`);
+  console.log(`token stored in .secrets/ (gitignored, never in the database)`);
+  console.log(`next: jarvis ingest --google --handle ${handle} --days 30`);
 }
 
 async function cmdEmbed() {
@@ -325,12 +426,94 @@ async function cmdTest() {
     await q(`DELETE FROM entities WHERE name = 'Self Test'`);
   }
 
+  // ------------------------------------------------------- gmail mapping
+  //
+  // The network half of the Gmail adapter cannot be exercised without a real
+  // mailbox. The mapping half can, and it is where the subtle errors live: a
+  // multipart body whose text part is empty, an encoded-word subject, a reply
+  // whose quoted history is longer than the message itself.
+  const { toEvent, extractBody, header } = await import("./adapters/gmail.ts");
+  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64url");
+
+  const multipart = {
+    id: "18ff00aa", threadId: "18ff00a0",
+    internalDate: "1760000000000",
+    labelIds: ["INBOX", "IMPORTANT"],
+    payload: {
+      mimeType: "multipart/alternative",
+      headers: [
+        { name: "From", value: "Tim Reinmann <tim@example.com>" },
+        { name: "To", value: `Brady <${marker}@example.com>, ops@example.com` },
+        { name: "Cc", value: "watch desk <desk@example.com>" },
+        { name: "Subject", value: "=?UTF-8?B?U3VibWFyaW5lciDigJQgZnVsbCBzZXQ=?=" },
+      ],
+      parts: [
+        { mimeType: "text/plain", body: { data: b64("Seller wants 9000 for the 126610LN.\n\nOn Tue, Tim wrote:\n> old quoted thread that should not survive") } },
+        { mimeType: "text/html", body: { data: b64("<p>ignored when plain exists</p>") } },
+        { mimeType: "application/pdf", filename: "cert.pdf", body: { attachmentId: "x" } },
+      ],
+    },
+  };
+
+  const mapped = toEvent(multipart, { spaceId: "personal", sourceId: marker, myAddresses: [`${marker}@example.com`] });
+
+  check("gmail: prefers the text/plain part over html",
+    mapped.body === "Seller wants 9000 for the 126610LN.");
+  check("gmail: strips quoted history",
+    !String(mapped.body).includes("old quoted thread"));
+  check("gmail: decodes an encoded-word subject",
+    mapped.subject === "Submariner — full set");
+  check("gmail: uses internalDate rather than the sender's Date header",
+    new Date(mapped.occurredAt as Date).getTime() === 1760000000000);
+  check("gmail: collects from, to and cc as participants",
+    mapped.participants?.length === 4
+    && mapped.participants.some((p) => p.value === "tim@example.com" && p.role === "from")
+    && mapped.participants.some((p) => p.value === "desk@example.com" && p.role === "cc"));
+  check("gmail: inbound when the sender is not me", mapped.direction === "inbound");
+  check("gmail: records attachment filenames without their bytes",
+    JSON.stringify((mapped.metadata as any)?.attachments) === JSON.stringify(["cert.pdf"]));
+  check("gmail: external id is the stable gmail message id", mapped.externalId === "18ff00aa");
+
+  const htmlOnly = {
+    id: "18ff00bb",
+    internalDate: "1760000001000",
+    payload: {
+      mimeType: "text/html",
+      headers: [{ name: "From", value: `Brady <${marker}@example.com>` }],
+      body: { data: b64("<div>Hi <b>there</b></div><p>second line</p>") },
+    },
+  };
+  const htmlMapped = toEvent(htmlOnly, { spaceId: "personal", sourceId: marker, myAddresses: [`${marker}@example.com`] });
+  check("gmail: falls back to html converted to text when there is no plain part",
+    htmlMapped.body === "Hi there\nsecond line");
+  check("gmail: outbound when I am the sender", htmlMapped.direction === "outbound");
+
+  check("gmail: an empty payload yields an empty body, not a crash",
+    extractBody(undefined) === "" && header({ id: "x" }, "subject") === undefined);
+
+  // End to end through the one ingest door, including idempotency, which is
+  // what makes re-running a sync after a failure safe.
+  try {
+    const gmailSource = await getOrCreateSource("personal", "gmail", `${marker}@example.com`);
+    const first = await ingestEvent(toEvent({ ...multipart, id: `${marker}-gm` },
+      { spaceId: "personal", sourceId: gmailSource, myAddresses: [] }));
+    const second = await ingestEvent(toEvent({ ...multipart, id: `${marker}-gm` },
+      { spaceId: "personal", sourceId: gmailSource, myAddresses: [] }));
+    check("gmail: a mapped message ingests and re-syncing does not duplicate it",
+      first.created && !second.created && first.id === second.id);
+  } finally {
+    await q(`DELETE FROM events WHERE external_id LIKE $1`, [`${marker}%`]);
+    await q(`DELETE FROM sources WHERE handle = $1`, [`${marker}@example.com`]);
+    await q(`DELETE FROM entities WHERE name IN ('Tim Reinmann', 'Brady', 'watch desk')`);
+  }
+
   console.log(failures ? `\n${failures} failed` : "\nall checks passed");
   process.exitCode = failures ? 1 : 0;
 }
 
 const commands: Record<string, () => Promise<void>> = {
   migrate: cmdMigrate,
+  connect: cmdConnect,
   ingest: cmdIngest,
   embed: cmdEmbed,
   doctor: cmdDoctor,
@@ -340,7 +523,7 @@ const commands: Record<string, () => Promise<void>> = {
 
 const run = commands[command ?? ""];
 if (!run) {
-  console.log("usage: jarvis <migrate|ingest|embed|serve|doctor|test>");
+  console.log("usage: jarvis <migrate|connect|ingest|embed|serve|doctor|test>");
   process.exit(1);
 }
 

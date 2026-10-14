@@ -76,8 +76,17 @@ file in `inbox/<space>/`, run `npm run ingest`, and it is dispatched by type.
 | **iMessage / SMS** | `npm run ingest -- --imessage --space personal` | Works now, macOS, needs Full Disk Access |
 | **Meeting transcripts** | Drop the file; named with "transcript" or "meeting" | Works now |
 | **Slack** | Workspace export, or a user token | Export works; live needs a token |
-| **Live Gmail sync** | Gmail API | Not built — Takeout covers the history |
+| **Live Gmail sync** | `jarvis connect --google --handle <email> --space <space>` | Works now; one mailbox per arena |
 | **Calls** | A recorder that writes transcripts to the drop folder | Not built; read `docs/RISKS.md` first |
+
+Mail works two ways on purpose. Takeout gets ten years of back catalogue in
+one file with no OAuth app to maintain, and `jarvis connect --google` keeps up
+from there. The live adapter only ever has to handle what arrived since, which
+is a much smaller problem than the archive.
+
+A mailbox is bound to one space at connect time and can never write anywhere
+else. That is the boundary doing the real work: no query filter downstream can
+put material back in the right arena once it has landed in the wrong one.
 
 The export route is not a workaround. For WhatsApp it is the *only* legitimate
 route — every library claiming live access to a personal account breaks their
