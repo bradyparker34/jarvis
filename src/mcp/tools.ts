@@ -65,10 +65,24 @@ export async function resolveScope(args: {
   include_confidential?: boolean;
 }): Promise<Scope> {
   const requested = args.spaces?.length ? args.spaces : null;
-  // Behaviour preserved exactly as shipped: omitting spaces sweeps everything
-  // shareable, and naming spaces reads those. cross_space is recorded but does
-  // not currently narrow a named list — see the note on the argument below.
-  const crossSpace = requested ? (args.cross_space ?? false) : true;
+  const crossSpace = requested ? args.cross_space === true : true;
+
+  // Naming more than one space is deliberate arena-blending and now has to say
+  // so. The parameter previously did nothing at all to a named list, so
+  // spaces: ['bitdeer','lawrence'] quietly returned employer material and the
+  // meat business fused into one result set — the exact mixing the space model
+  // exists to prevent.
+  //
+  // Omitting spaces is unaffected: that sweep is shareable-only by
+  // construction, so it can never pull an unshareable space in, and it is the
+  // documented default every caller relies on.
+  if (requested && requested.length > 1 && !crossSpace) {
+    throw new Error(
+      `reading ${requested.length} spaces at once (${requested.join(", ")}) requires cross_space: true. ` +
+      `These are separate businesses; combining them in one result set should be on purpose. ` +
+      `Omit spaces entirely to search everything shareable.`,
+    );
+  }
 
   const row = await one<{ spaces: string[] | null }>(
     `SELECT resolve_scope($1, $2) AS spaces`,
@@ -110,10 +124,7 @@ const spaceArg = {
   },
   cross_space: {
     type: "boolean",
-    // Honest description of current behaviour. The old text claimed the
-    // opposite of what the code does, and tightening it is an API change that
-    // needs a decision, so it is recorded rather than silently altered.
-    description: "Recorded on the retrieval log. Does not currently narrow a named spaces list: naming several spaces reads all of them.",
+    description: "Required when spaces names more than one space. These are separate businesses, so combining them in one result set has to be deliberate. Not needed for a single named space, or when spaces is omitted.",
   },
   include_confidential: {
     type: "boolean",

@@ -303,6 +303,20 @@ async function cmdTest() {
     const typo = await callTool("recall", { query: canary, spaces: ["bitdeerr"] }, "selftest");
     check("an unknown space id is an error, not silence",
       Boolean(typo.isError) && typo.content[0]!.text.includes("unknown space"));
+
+    // Blending arenas has to be asked for. A single named space does not.
+    const blended = await callTool("recall",
+      { query: canary, spaces: ["bitdeer", "personal"] }, "selftest");
+    check("naming two spaces without cross_space is refused",
+      Boolean(blended.isError) && blended.content[0]!.text.includes("cross_space"));
+
+    const deliberate = await callTool("recall",
+      { query: canary, spaces: ["bitdeer", "personal"], cross_space: true }, "selftest");
+    check("naming two spaces with cross_space works",
+      !deliberate.isError && deliberate.content[0]!.text.includes(secret));
+
+    const single = await callTool("recall", { query: canary, spaces: ["personal"] }, "selftest");
+    check("a single named space needs no cross_space", !single.isError);
   } finally {
     // Clean up, including anything planted before a check threw.
     await q(`DELETE FROM decisions WHERE title IN ($1, $2)`, [marker, secret]);

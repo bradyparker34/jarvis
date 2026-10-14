@@ -89,7 +89,11 @@ const server = createServer(async (req, res) => {
       // the bridge — rendered the Bitdeer graph. It now goes through the same
       // resolver as the tools: omitting spaces means everything shareable.
       const requested = url.searchParams.get("spaces")?.split(",").filter(Boolean);
-      const scope = await resolveScope(requested?.length ? { spaces: requested } : {});
+      const scope = await resolveScope(
+        requested?.length
+          ? { spaces: requested, cross_space: url.searchParams.get("cross_space") === "true" }
+          : {},
+      );
       const limit = Math.min(Number(url.searchParams.get("limit") ?? 400), 2000);
       return json(res, 200, await graphSnapshot(scope, limit));
     }
